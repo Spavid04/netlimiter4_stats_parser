@@ -163,6 +163,20 @@ class RawAppsRow(ctypes.Structure):
         return "\n".join(field + ": " + str(getattr(self, field)) for (field, _) in self._fields_)
 
 
+class RawUsersRow(ctypes.Structure):
+    # unused, only for reference
+    _pack_ = 1
+    _fields_ = [
+        ("user_id", ctypes.c_uint16),
+
+        ("user_sid_length", ctypes.c_uint16),
+        ("sid", ctypes.c_byte * 0)
+    ]
+
+    def __str__(self):
+        return "\n".join(field + ": " + str(getattr(self, field)) for (field, _) in self._fields_)
+
+
 class RawIPv4LocationRangeRow(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
