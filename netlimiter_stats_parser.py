@@ -33,14 +33,11 @@
 #   *
 # Locations.dat specific: strings are ASCII encoded
 
-import abc
 import ctypes
 import datetime
 import io
 import ipaddress
-import itertools
 import os
-import shutil
 import struct
 import typing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -82,6 +79,28 @@ def _chunkify(f: typing.BinaryIO, chunk_size: int) -> typing.Generator[io.BytesI
 
         yield buffer
 
+
+class BinaryFDAdapter():
+    def __init__(self, pathOrFd: typing.Union[str, typing.BinaryIO], writable: bool = False):
+        self.pathOrFd = pathOrFd
+        self.writable = writable
+        self._toClose = False
+        self.fd: typing.BinaryIO = None
+
+    def __enter__(self) -> typing.BinaryIO:
+        if isinstance(self.pathOrFd, str):
+            self._toClose = True
+            self.fd = open(self.pathOrFd, "wb" if self.writable else "rb")
+        elif isinstance(self.pathOrFd, io.IOBase):
+            self.fd = self.pathOrFd
+        else:
+            raise ValueError()
+
+        return self.fd
+
+    def __exit__(self, _, __, ___):
+        if self._toClose:
+            self.fd.close()
 
 # endregion
 
@@ -248,7 +267,7 @@ class RawLocationChunk(ctypes.Structure):
 
 
 class StatsRow:
-    def __init__(self, raw_row: typing.Union[RawStatsRowV4, RawStatsRowV4]):
+    def __init__(self, raw_row: typing.Union[RawStatsRowV4, RawStatsRowV6]):
         self.raw_row = raw_row
         self.ip_version = 4 if isinstance(raw_row, RawStatsRowV4) else 6
 
@@ -308,8 +327,8 @@ class AppRow:
         if len(header) != 4:
             return None
 
-        app_id = int.from_bytes(header[0:2], byteorder="little")
-        path_length = int.from_bytes(header[2:4], byteorder="little")
+        app_id = int.from_bytes(header[0:2], byteorder="little", signed=False)
+        path_length = int.from_bytes(header[2:4], byteorder="little", signed=False)
 
         raw = stream.read(path_length * 2)
         if not raw:
@@ -319,60 +338,110 @@ class AppRow:
 
         return AppRow(app_id, raw.decode("utf-16"))
 
+    def to_bytes(self) -> bytes:
+        b = self.app_id.to_bytes(2, byteorder="little", signed=False)
+        b += (len(self.path) * 2).to_bytes(2, byteorder="little", signed=False)
+        b += self.path.encode("utf-16")
+        return b
 
-def get_apps(path: str) -> typing.Generator[AppRow, None, None]:
-    with open(path, "rb") as f:
+
+class UserRow:
+    def __init__(self, user_id: int, sid: bytes):
+        self.user_id = user_id
+        self.sid = sid
+
+    @staticmethod
+    def from_stream(stream: typing.BinaryIO) -> typing.Optional["UserRow"]:
+        header = stream.read(4)
+        if not header:
+            return None
+        if len(header) != 4:
+            return None
+
+        user_id = int.from_bytes(header[0:2], byteorder="little", signed=False)
+        user_sid_length = int.from_bytes(header[2:4], byteorder="little", signed=False)
+
+        raw = stream.read(user_sid_length)
+        if not raw:
+            return None
+        if len(raw) != user_sid_length:
+            return None
+
+        return UserRow(user_id, raw)
+
+    def to_bytes(self) -> bytes:
+        b = self.user_id.to_bytes(2, byteorder="little", signed=False)
+        b += (len(self.sid)).to_bytes(2, byteorder="little", signed=False)
+        b += self.sid
+        return b
+
+
+def get_apps(pathOrFd: typing.Union[str, typing.BinaryIO]) -> typing.Generator[AppRow, None, None]:
+    with BinaryFDAdapter(pathOrFd) as f:
         while True:
             row = AppRow.from_stream(f)
             if not row:
                 break
             yield row
 
+def get_users(pathOrFd: typing.Union[str, typing.BinaryIO]) -> typing.Generator[UserRow, None, None]:
+    with BinaryFDAdapter(pathOrFd) as f:
+        while True:
+            row = UserRow.from_stream(f)
+            if not row:
+                break
+            yield row
 
-def get_rows(path: str) -> typing.Generator[StatsRow, None, None]:
-    version = 4 if "4" in os.path.split(path)[1] else 6
-    sizeof = ctypes.sizeof(RawStatsRowV4 if version == 4 else RawStatsRowV6)
-    class_type = RawStatsRowV4 if version == 4 else RawStatsRowV6
+def __get_rows_commons(pathOrFd: typing.Union[str, typing.BinaryIO], ipv6: bool = None):
+    bfda = BinaryFDAdapter(pathOrFd)
+    if isinstance(pathOrFd, str):
+        if ipv6 is None:
+            ipv6 = "6" in os.path.split(pathOrFd)[1]
+    elif isinstance(pathOrFd, io.IOBase):
+        if ipv6 is None:
+            raise ValueError()
+    else:
+        raise ValueError()
+    classType = RawStatsRowV6 if ipv6 else RawStatsRowV4
+    sizeof = ctypes.sizeof(classType)
 
-    with open(path, "rb") as f:
+    return (bfda, classType, sizeof)
+
+def get_rows(pathOrFd: typing.Union[str, typing.BinaryIO], ipv6: bool = None) -> typing.Generator[StatsRow, None, None]:
+    (bfda, classType, sizeof) = __get_rows_commons(pathOrFd, ipv6)
+
+    with bfda as f:
         while True:
             buffer = f.read(sizeof)
             if not buffer:
                 break
-            yield StatsRow(class_type.from_buffer_copy(buffer))
+            yield StatsRow(classType.from_buffer_copy(buffer))
 
 
-def __process_batch(class_type, sizeof, buffer):
+def __process_batch(classType, sizeof, buffer):
     data_rows = []
     offset = 0
 
     while offset < len(buffer):
-        data_rows.append(StatsRow(class_type.from_buffer_copy(buffer, offset)))
+        data_rows.append(StatsRow(classType.from_buffer_copy(buffer, offset)))
         offset += sizeof
 
     return data_rows
-
-
-def get_batched_rows(path: str, batch_size: int = 1000) -> typing.Generator[typing.List[StatsRow], None, None]:
-    version = 4 if "4" in os.path.split(path)[1] else 6
-    sizeof = ctypes.sizeof(RawStatsRowV4 if version == 4 else RawStatsRowV6)
-    class_type = RawStatsRowV4 if version == 4 else RawStatsRowV6
-
+def get_batched_rows(pathOrFd: str, ipv6: bool = None, batch_size: int = 1000) -> typing.Generator[typing.List[StatsRow], None, None]:
+    (bfda, classType, sizeof) = __get_rows_commons(pathOrFd, ipv6)
     batch_byte_size = sizeof * batch_size
-    pool = ThreadPoolExecutor()
-    futures = []
 
-    with open(path, "rb") as f:
+    futures = []
+    with ThreadPoolExecutor() as pool, bfda as f:
         while True:
             buffer = f.read(batch_byte_size)
             if not buffer:
                 break
 
-            futures.append(pool.submit(__process_batch, class_type, sizeof, buffer))
+            futures.append(pool.submit(__process_batch, classType, sizeof, buffer))
 
     for future in futures:
         yield future.result()
-    pool.shutdown()
 
 
 # endregion
