@@ -33,6 +33,7 @@
 #   *
 # Locations.dat specific: strings are ASCII encoded
 
+import collections
 import ctypes
 import datetime
 import io
@@ -112,17 +113,17 @@ class RawStatsTransferData(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
         ("data_out_payload", ctypes.c_uint32),
-        ("zero1", ctypes.c_uint16), # seems to always be (WORD)0
+        ("zero1", ctypes.c_uint16), # seems to USUALLY be (WORD)0
         ("app_id", ctypes.c_uint16),
         ("data_in_payload", ctypes.c_uint32),
-        ("zero2", ctypes.c_uint16), # seems to always be (WORD)0
-        ("u2_flags", ctypes.c_uint16), # unknown WORD
+        ("zero2", ctypes.c_uint16), # seems to USUALLY be (WORD)0
+        ("user_id", ctypes.c_uint16), # possibly user_id
         ("data_out_overhead", ctypes.c_uint32),
         ("zero3", ctypes.c_uint16), # seems to always be (WORD)0
         ("u3_flags", ctypes.c_uint16), # unknown WORD
         ("data_in_overhead", ctypes.c_uint32),
         ("zero4", ctypes.c_uint16), # seems to always be (WORD)0
-        ("network_id", ctypes.c_uint16)
+        ("network_id", ctypes.c_uint16) # possibly network_id
     ]
 
     def __str__(self):
@@ -336,12 +337,12 @@ class AppRow:
         if len(raw) != path_length * 2:
             return None
 
-        return AppRow(app_id, raw.decode("utf-16"))
+        return AppRow(app_id, raw.decode("utf-16le"))
 
     def to_bytes(self) -> bytes:
         b = self.app_id.to_bytes(2, byteorder="little", signed=False)
         b += (len(self.path) * 2).to_bytes(2, byteorder="little", signed=False)
-        b += self.path.encode("utf-16")
+        b += self.path.encode("utf-16le")
         return b
 
 
@@ -427,17 +428,20 @@ def __process_batch(classType, sizeof, buffer):
         offset += sizeof
 
     return data_rows
-def get_batched_rows(pathOrFd: str, ipv6: bool = None, batch_size: int = 1000) -> typing.Generator[typing.List[StatsRow], None, None]:
+def get_batched_rows(pathOrFd: typing.Union[str, typing.BinaryIO], ipv6: bool = None, batch_size: int = 1000) -> typing.Generator[typing.List[StatsRow], None, None]:
     (bfda, classType, sizeof) = __get_rows_commons(pathOrFd, ipv6)
     batch_byte_size = sizeof * batch_size
 
-    futures = []
+    futures = collections.deque()
     with ThreadPoolExecutor() as pool, bfda as f:
         while True:
             buffer = f.read(batch_byte_size)
             if not buffer:
                 break
 
+            if len(futures) > 0:
+                if futures[0].done():
+                    yield futures.popleft().result()
             futures.append(pool.submit(__process_batch, classType, sizeof, buffer))
 
     for future in futures:
