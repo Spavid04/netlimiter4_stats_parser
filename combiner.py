@@ -98,20 +98,13 @@ def _separateNewAddends(base: typing.Iterable[T], addend: typing.Iterable[T]) \
 
 def _yield_ordered_rows(baseGenerator: typing.Generator[nsp.StatsRow, None, None], addendGenerator: typing.Generator[nsp.StatsRow, None, None]) \
         -> typing.Generator[typing.Tuple[typing.Union[nsp.RawStatsRowV4 | nsp.RawStatsRowV6], bool], None, None]:
-    basePtr = next(baseGenerator)
-    addendPtr = next(addendGenerator)
+    basePtr = next(baseGenerator, None)
+    addendPtr = next(addendGenerator, None)
     while True:
         nextRow = None
         fromAddend = False
 
-        if basePtr is None:
-            nextRow = addendPtr.raw_row
-            addendPtr = next(addendGenerator, None)
-            fromAddend = True
-        elif addendPtr is None:
-            nextRow = basePtr.raw_row
-            basePtr = next(baseGenerator, None)
-        else:
+        if basePtr is not None and addendPtr is not None:
             if basePtr.raw_timestamp <= addendPtr.raw_timestamp:
                 nextRow = basePtr.raw_row
                 basePtr = next(baseGenerator, None)
@@ -119,11 +112,52 @@ def _yield_ordered_rows(baseGenerator: typing.Generator[nsp.StatsRow, None, None
                 nextRow = addendPtr.raw_row
                 addendPtr = next(addendGenerator, None)
                 fromAddend = True
-
-        if nextRow is None:
+        elif addendPtr is not None:
+            nextRow = addendPtr.raw_row
+            addendPtr = next(addendGenerator, None)
+            fromAddend = True
+        elif basePtr is not None:
+            nextRow = basePtr.raw_row
+            basePtr = next(baseGenerator, None)
+        else:
             break
 
         yield (nextRow, fromAddend)
+
+def _copy_stat_rows(addendAppsMapping: typing.Dict[int, str],
+                    newAppsInAddend: typing.Dict[str, int],
+                    addendUsersMapping: typing.Dict[int, bytes],
+                    newUsersInAddend: typing.Dict[bytes, int],
+                    baseFd: typing.BinaryIO,
+                    addendFd: typing.BinaryIO,
+                    resultFd: typing.BinaryIO,
+                    ipv6: bool):
+    for (row, fromAddend) in _yield_ordered_rows(nsp.get_rows(baseFd, ipv6), nsp.get_rows(addendFd, ipv6)):
+        if fromAddend:
+            # update appid if needed
+            if row.transfer_data.app_id != 0:
+                # appid 0 is special (system?)
+                oldAppId = row.transfer_data.app_id
+                if oldAppId in addendAppsMapping:
+                    path = addendAppsMapping[oldAppId]
+                    if path in newAppsInAddend:
+                        newAppId = newAppsInAddend[path]
+                        row.transfer_data.app_id = newAppId
+                else:
+                    print("Desync: app id %d not found in the corresponding app list" % oldAppId)
+
+            # update userid if needed
+            if row.transfer_data.user_id != 0:
+                oldUserId = row.transfer_data.user_id
+                if oldUserId in addendUsersMapping:
+                    sid = addendUsersMapping[oldUserId]
+                    if sid in newUsersInAddend:
+                        newUserId = newUsersInAddend[sid]
+                        row.transfer_data.user_id = newUserId
+                else:
+                    print("Desync: user id %d not found in the corresponding user list" % oldUserId)
+
+        resultFd.write(bytearray(row))
 
 def _combine(base: _PackData, addend: _PackData, result: _PackData):
     #region app merging
@@ -160,27 +194,6 @@ def _combine(base: _PackData, addend: _PackData, result: _PackData):
         newUsersInAddend[key] += maxBaseUserId
     #endregion
 
-    def copy_stat_rows(baseFd: typing.BinaryIO, addendFd: typing.BinaryIO, resultFd: typing.BinaryIO, ipv6: bool):
-        for (row, fromAddend) in _yield_ordered_rows(nsp.get_rows(baseFd, ipv6), nsp.get_rows(addendFd, ipv6)):
-            if fromAddend:
-                # update appid if needed
-                if row.transfer_data.app_id != 0:
-                    # appid 0 is special (system?)
-                    oldAppId = row.transfer_data.app_id
-                    path = addendAppsMapping[oldAppId]
-                    if path in newAppsInAddend:
-                        newAppId = newAppsInAddend[path]
-                        row.transfer_data.app_id = newAppId
-
-                # update userid if needed
-                oldUserId = row.transfer_data.user_id
-                sid = addendUsersMapping[oldUserId]
-                if sid in newUsersInAddend:
-                    newUserId = newUsersInAddend[sid]
-                    row.transfer_data.user_id = newUserId
-
-            resultFd.write(bytearray(row))
-
     for app in sorted(baseApps, key=lambda x: x.app_id):
         result.appsFD.write(app.to_bytes())
     for (path, app_id) in sorted(newAppsInAddend.items(), key=lambda x: x[1]):
@@ -191,9 +204,8 @@ def _combine(base: _PackData, addend: _PackData, result: _PackData):
     for (sid, user_id) in sorted(newUsersInAddend.items(), key=lambda x: x[1]):
         result.usersFD.write(nsp.UserRow(user_id, sid).to_bytes())
 
-    copy_stat_rows(base.nlstatsv4FD, addend.nlstatsv4FD, result.nlstatsv4FD, False)
-
-    copy_stat_rows(base.nlstatsv6FD, addend.nlstatsv6FD, result.nlstatsv6FD, True)
+    _copy_stat_rows(addendAppsMapping, newAppsInAddend, addendUsersMapping, newUsersInAddend, base.nlstatsv4FD, addend.nlstatsv4FD, result.nlstatsv4FD, False)
+    _copy_stat_rows(addendAppsMapping, newAppsInAddend, addendUsersMapping, newUsersInAddend, base.nlstatsv6FD, addend.nlstatsv6FD, result.nlstatsv6FD, True)
 
 def combine(basePack: Pack, addendPack: Pack, resultPack: Pack):
     base = _PackData(basePack, False)

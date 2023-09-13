@@ -289,6 +289,7 @@ class StatsRow:
         self.data_in_total = self.data_in_payload + self.data_in_overhead
 
         self.app_id = raw_row.transfer_data.app_id
+        self.user_id = raw_row.transfer_data.user_id
         self.network_id = raw_row.transfer_data.network_id
 
     @property
